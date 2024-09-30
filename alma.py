@@ -8,28 +8,38 @@ from modelutils import *
 from quant import *
 
 
-def get_llama(model):
+def get_alma(model):
     import torch
     def skip(*args, **kwargs):
         pass
     torch.nn.init.kaiming_uniform_ = skip
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
-    from transformers import LlamaForCausalLM
-    model = LlamaForCausalLM.from_pretrained(model, torch_dtype='auto')
+    # from transformers import LlamaForCausalLM
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM
+    from transformers import LlamaTokenizer
+
+    model = AutoModelForCausalLM.from_pretrained(f"{args.model}-Pretrain", torch_dtype=torch.float16, device_map="auto")
+    model = PeftModel.from_pretrained(model, f"{args.model}-Pretrain-LoRA")
+    tokenizer = LlamaTokenizer.from_pretrained(f"{args.model}-Pretrain", padding_side='left')
+
     model.seqlen = 2048
     return model
 
 @torch.no_grad()
-def llama_sequential(model, dataloader, dev):
-    print('Starting LLAMA ...')
+def alma_sequential(model, dataloader, dev):
+    print('Starting ALMA ...')
 
     use_cache = model.config.use_cache
     model.config.use_cache = False
-    layers = model.model.layers
 
-    model.model.embed_tokens = model.model.embed_tokens.to(dev)
-    model.model.norm = model.model.norm.to(dev)
+    # print('model.model.model', model.model.model)
+    print('model.model.model.embed_tokens', model.model.model.embed_tokens)
+    layers = model.model.model.layers
+    model.model.model.embed_tokens = model.model.model.embed_tokens.to(dev)
+    model.model.model.norm = model.model.model.norm.to(dev)
+   
     layers[0] = layers[0].to(dev)
 
     dtype = next(iter(model.parameters())).dtype
@@ -57,8 +67,8 @@ def llama_sequential(model, dataloader, dev):
     layers[0] = layers[0].module
 
     layers[0] = layers[0].cpu()
-    model.model.embed_tokens = model.model.embed_tokens.cpu()
-    model.model.norm = model.model.norm.cpu()
+    model.model.model.embed_tokens = model.model.model.embed_tokens.cpu()
+    model.model.model.norm = model.model.model.norm.cpu()
     torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
@@ -128,18 +138,17 @@ def llama_sequential(model, dataloader, dev):
     
     return quantizers
 
-@torch.no_grad()
-def llama_eval(model, testenc, dev):
-    print('Evaluating LLAMA...')
+def alma_eval(model, testenc, dev):
+    print('Evaluating ALMA ...')
 
     testenc = testenc.input_ids
     nsamples = testenc.numel() // model.seqlen
 
     use_cache = model.config.use_cache
     model.config.use_cache = False
-    layers = model.model.layers
+    layers = model.model.model.layers
 
-    model.model.embed_tokens = model.model.embed_tokens.to(dev)
+    model.model.model.embed_tokens = model.model.model.embed_tokens.to(dev)
     layers[0] = layers[0].to(dev)
 
     dtype = next(iter(model.parameters())).dtype
@@ -168,7 +177,7 @@ def llama_eval(model, testenc, dev):
     layers[0] = layers[0].module
 
     layers[0] = layers[0].cpu()
-    model.model.embed_tokens = model.model.embed_tokens.cpu()
+    model.model.model.embed_tokens = model.model.model.embed_tokens.cpu()
     torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
@@ -199,16 +208,16 @@ def llama_eval(model, testenc, dev):
         torch.cuda.empty_cache()
         inps, outs = outs, inps
 
-    if model.model.norm is not None:
-        model.model.norm = model.model.norm.to(dev)
+    if model.model.model.norm is not None:
+        model.model.model.norm = model.model.model.norm.to(dev)
     model.lm_head = model.lm_head.to(dev)
 
     testenc = testenc.to(dev)
     nlls = []
     for i in range(nsamples):
         hidden_states = inps[i].unsqueeze(0)
-        if model.model.norm is not None:
-            hidden_states = model.model.norm(hidden_states)
+        if model.model.model.norm is not None:
+            hidden_states = model.model.model.norm(hidden_states)
         lm_logits = model.lm_head(hidden_states)
         shift_logits = lm_logits[:, :-1, :].contiguous()
         shift_labels = testenc[
@@ -223,8 +232,12 @@ def llama_eval(model, testenc, dev):
 
     model.config.use_cache = use_cache
 
-def llama_pack3(model, quantizers):
+def alma_pack3(model, quantizers):
     layers = find_layers(model)
+    print('layers', layers)
+    # print('PRINTED LIST', [n for n in quantizers])
+    quantizers = ['model.' + n for n in quantizers]
+    print('PRINTED LIST', [n for n in quantizers])
     layers = {n: layers[n] for n in quantizers}
     make_quant3(model, quantizers)
     qlayers = find_layers(model, [Quant3Linear])
@@ -234,7 +247,7 @@ def llama_pack3(model, quantizers):
         quantizers[name] = quantizers[name].cpu()
         qlayers[name].pack(layers[name], quantizers[name].scale, quantizers[name].zero)
     print('Done.')
-    return model
+    return model, quantizers
 
 
 if __name__ == '__main__':
@@ -284,6 +297,10 @@ if __name__ == '__main__':
         help='Save quantized checkpoint under this name.'
     )
     parser.add_argument(
+        '--save-quantizers', type=str, default='',
+        help='Save quantizers checkpoint under this name.'
+    )
+    parser.add_argument(
         '--new-eval', action='store_true',
         help='Whether to use the new PTB and C4 eval.'
     )
@@ -301,8 +318,9 @@ if __name__ == '__main__':
     )
 
     args = parser.parse_args()
-    
-    model = get_llama(args.model)
+
+    model = get_alma(args.model)
+    print('model', args.model)
     model.eval()
 
     dataloader, testloader = get_loaders(
@@ -311,20 +329,32 @@ if __name__ == '__main__':
 
     if args.wbits < 16 and not args.nearest:
         tick = time.time()
-        quantizers = llama_sequential(model, dataloader, DEV)
+        # if os.path.exists(args.save_quantizers):
+        #     print('Loading quantizer from quantized checkpoint')
+        #     pass
+        #     ##to implement
+        # else:
+        quantizers = alma_sequential(model, dataloader, DEV)    
+        
         print('Total time:', time.time() - tick)
 
     datasets = ['wikitext2', 'ptb', 'c4'] 
     if args.new_eval:
         datasets = ['wikitext2', 'ptb-new', 'c4-new']
     for dataset in datasets:
-        dataloader, testloader = get_loaders(
-            dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
-        )
-        print(dataset)
-        llama_eval(model, testloader, DEV)
+        if dataset == args.dataset:
+            dataloader, testloader = get_loaders(
+                dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
+            )
+            print(dataset)
+            alma_eval(model, testloader, DEV)
 
     if args.save:
-        llama_pack3(model, quantizers)
+        model, quantizers = alma_pack3(model, quantizers)
+        
         torch.save(model.state_dict(), args.save)
+        torch.save(quantizers, args.save_quantizers)
+
+    # if args.save:
+    #     torch.save(model.state_dict(), args.save)
 
