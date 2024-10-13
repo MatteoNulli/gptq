@@ -2,252 +2,80 @@ import time
 
 import torch
 import torch.nn as nn
+import os
 
 from gptq import *
 from modelutils import *
 from quant import *
+from pathlib import Path
+from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaTokenizer, GPTQConfig
+from auto_gptq import AutoGPTQForCausalLM, BaseQuantizeConfig
+from optimum.gptq import GPTQQuantizer, load_quantized_model
 
+def quantize_alma(model):
 
-def get_alma(model):
-    import torch
     def skip(*args, **kwargs):
         pass
     torch.nn.init.kaiming_uniform_ = skip
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
     # from transformers import LlamaForCausalLM
-    from peft import PeftModel
-    from transformers import AutoModelForCausalLM
-    from transformers import LlamaTokenizer
 
-    model = AutoModelForCausalLM.from_pretrained(f"{args.model}-Pretrain", torch_dtype=torch.float16, device_map="auto")
-    model = PeftModel.from_pretrained(model, f"{args.model}-Pretrain-LoRA")
+
     tokenizer = LlamaTokenizer.from_pretrained(f"{args.model}-Pretrain", padding_side='left')
+    gptq_config = GPTQConfig(bits=args.wbits, dataset="c4", tokenizer=tokenizer)
+    quantized_model = AutoModelForCausalLM.from_pretrained(args.model, device_map="auto", quantization_config=gptq_config)
 
-    model.seqlen = 2048
-    return model
+    return quantized_model
 
-@torch.no_grad()
-def alma_sequential(model, dataloader, dev):
-    print('Starting ALMA ...')
+def quantize_alma_autgptq(model):
 
-    use_cache = model.config.use_cache
-    model.config.use_cache = False
+    def skip(*args, **kwargs):
+        pass
+    torch.nn.init.kaiming_uniform_ = skip
+    torch.nn.init.uniform_ = skip
+    torch.nn.init.normal_ = skip
+    # from transformers import LlamaForCausalLM
+    tokenizer = AutoTokenizer.from_pretrained(f"{args.model}-Pretrain", padding_side='left')
 
-    # print('model.model.model', model.model.model)
-    print('model.model.model.embed_tokens', model.model.model.embed_tokens)
-    layers = model.model.model.layers
-    model.model.model.embed_tokens = model.model.model.embed_tokens.to(dev)
-    model.model.model.norm = model.model.model.norm.to(dev)
-   
-    layers[0] = layers[0].to(dev)
+    examples = [
+        tokenizer(
+            "auto-gptq is an easy-to-use model quantization library with user-friendly apis, based on GPTQ algorithm."
+        )
+    ]
 
-    dtype = next(iter(model.parameters())).dtype
-    inps = torch.zeros(
-        (args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
+
+    quantize_config = BaseQuantizeConfig(
+        bits=args.wbits,  # quantize model to 4-bit
+        group_size=128,  # it is recommended to set the value to 128
+        desc_act=False,  # set to False can significantly speed up inference but the perplexity may slightly bad
     )
-    cache = {'i': 0, 'attention_mask': None}
 
-    class Catcher(nn.Module):
-        def __init__(self, module):
-            super().__init__()
-            self.module = module
-        def forward(self, inp, **kwargs):
-            inps[cache['i']] = inp
-            cache['i'] += 1
-            cache['attention_mask'] = kwargs['attention_mask']
-            cache['position_ids'] = kwargs['position_ids']
-            raise ValueError
-    layers[0] = Catcher(layers[0])
-    for batch in dataloader:
-        try:
-            model(batch[0].to(dev))
-        except ValueError:
-            pass
-    layers[0] = layers[0].module
+    # load un-quantized model, by default, the model will always be loaded into CPU memory
+    model = AutoGPTQForCausalLM.from_pretrained(args.model, quantize_config, device_map="auto")
 
-    layers[0] = layers[0].cpu()
-    model.model.model.embed_tokens = model.model.model.embed_tokens.cpu()
-    model.model.model.norm = model.model.model.norm.cpu()
-    torch.cuda.empty_cache()
+    # quantize model, the examples should be list of dict whose keys can only be "input_ids" and "attention_mask"
+    model.quantize()
 
-    outs = torch.zeros_like(inps)
-    attention_mask = cache['attention_mask']
-    position_ids = cache['position_ids']
-
-    print('Ready.')
-
-    quantizers = {}
-    for i in range(len(layers)):
-        layer = layers[i].to(dev)
-        full = find_layers(layer)
-
-        if args.true_sequential:
-            sequential = [
-                ['self_attn.k_proj', 'self_attn.v_proj', 'self_attn.q_proj'],
-                ['self_attn.o_proj'],
-                ['mlp.up_proj', 'mlp.gate_proj'],
-                ['mlp.down_proj']
-            ]
-        else:
-            sequential = [list(full.keys())]
-       
-        for names in sequential:
-            subset = {n: full[n] for n in names}
-
-            gptq = {}
-            for name in subset:
-                gptq[name] = GPTQ(subset[name])
-                gptq[name].quantizer = Quantizer()
-                gptq[name].quantizer.configure(
-                    args.wbits, perchannel=True, sym=args.sym, mse=False
-                )
-
-            def add_batch(name):
-                def tmp(_, inp, out):
-                    gptq[name].add_batch(inp[0].data, out.data)
-                return tmp
-            handles = []
-            for name in subset:
-                handles.append(subset[name].register_forward_hook(add_batch(name)))
-            for j in range(args.nsamples):
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-            for h in handles:
-                h.remove()
-
-            for name in subset:
-                print(i, name)
-                print('Quantizing ...')
-                gptq[name].fasterquant(
-                    percdamp=args.percdamp, groupsize=args.groupsize, actorder=args.act_order, static_groups=args.static_groups
-                )
-                quantizers['model.layers.%d.%s' % (i, name)] = gptq[name].quantizer
-                gptq[name].free()
-
-        for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-
-        layers[i] = layer.cpu()
-        del layer
-        del gptq 
-        torch.cuda.empty_cache()
-
-        inps, outs = outs, inps
-
-    model.config.use_cache = use_cache
     
-    return quantizers
+    return model
+def quantize_gptqquantizer(model):
 
-def alma_eval(model, testenc, dev):
-    print('Evaluating ALMA ...')
+    def skip(*args, **kwargs):
+        pass
+    torch.nn.init.kaiming_uniform_ = skip
+    torch.nn.init.uniform_ = skip
+    torch.nn.init.normal_ = skip
+    # from transformers import LlamaForCausalLM
+    tokenizer = AutoTokenizer.from_pretrained(f"{args.model}-Pretrain", padding_side='left', device_map="auto")
 
-    testenc = testenc.input_ids
-    nsamples = testenc.numel() // model.seqlen
+            
+    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float16, device_map="auto")
 
-    use_cache = model.config.use_cache
-    model.config.use_cache = False
-    layers = model.model.model.layers
+    quantizer = GPTQQuantizer(bits=args.wbits, dataset="c4", model_seqlen = 2048)
+    quantized_model = quantizer.quantize_model(model, tokenizer)
 
-    model.model.model.embed_tokens = model.model.model.embed_tokens.to(dev)
-    layers[0] = layers[0].to(dev)
-
-    dtype = next(iter(model.parameters())).dtype
-    inps = torch.zeros(
-        (nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
-    )
-    cache = {'i': 0, 'attention_mask': None}
-
-    class Catcher(nn.Module):
-        def __init__(self, module):
-            super().__init__()
-            self.module = module
-        def forward(self, inp, **kwargs):
-            inps[cache['i']] = inp
-            cache['i'] += 1
-            cache['attention_mask'] = kwargs['attention_mask']
-            cache['position_ids'] = kwargs['position_ids']
-            raise ValueError
-    layers[0] = Catcher(layers[0])
-    for i in range(nsamples):
-        batch = testenc[:, (i * model.seqlen):((i + 1) * model.seqlen)].to(dev)
-        try:
-            model(batch)
-        except ValueError:
-            pass
-    layers[0] = layers[0].module
-
-    layers[0] = layers[0].cpu()
-    model.model.model.embed_tokens = model.model.model.embed_tokens.cpu()
-    torch.cuda.empty_cache()
-
-    outs = torch.zeros_like(inps)
-    attention_mask = cache['attention_mask']
-    position_ids = cache['position_ids']
-
-    for i in range(len(layers)):
-        print(i)
-        layer = layers[i].to(dev)
-        
-        if args.nearest:
-            subset = find_layers(layer)
-            for name in subset:
-                quantizer = Quantizer()
-                quantizer.configure(
-                    args.wbits, perchannel=True, sym=False, mse=False
-                )
-                W = subset[name].weight.data
-                quantizer.find_params(W, weight=True)
-                subset[name].weight.data = quantize(
-                    W, quantizer.scale, quantizer.zero, quantizer.maxq
-                ).to(next(iter(layer.parameters())).dtype)
-
-        for j in range(nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-        layers[i] = layer.cpu()
-        del layer
-        torch.cuda.empty_cache()
-        inps, outs = outs, inps
-
-    if model.model.model.norm is not None:
-        model.model.model.norm = model.model.model.norm.to(dev)
-    model.lm_head = model.lm_head.to(dev)
-
-    testenc = testenc.to(dev)
-    nlls = []
-    for i in range(nsamples):
-        hidden_states = inps[i].unsqueeze(0)
-        if model.model.model.norm is not None:
-            hidden_states = model.model.model.norm(hidden_states)
-        lm_logits = model.lm_head(hidden_states)
-        shift_logits = lm_logits[:, :-1, :].contiguous()
-        shift_labels = testenc[
-            :, (i * model.seqlen):((i + 1) * model.seqlen)
-        ][:, 1:]
-        loss_fct = nn.CrossEntropyLoss()
-        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        neg_log_likelihood = loss.float() * model.seqlen
-        nlls.append(neg_log_likelihood)
-    ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
-    print(ppl.item())
-
-    model.config.use_cache = use_cache
-
-def alma_pack3(model, quantizers):
-    layers = find_layers(model)
-    print('layers', layers)
-    # print('PRINTED LIST', [n for n in quantizers])
-    quantizers = ['model.' + n for n in quantizers]
-    print('PRINTED LIST', [n for n in quantizers])
-    layers = {n: layers[n] for n in quantizers}
-    make_quant3(model, quantizers)
-    qlayers = find_layers(model, [Quant3Linear])
-    print('Packing ...')
-    for name in qlayers:
-        print(name)
-        quantizers[name] = quantizers[name].cpu()
-        qlayers[name].pack(layers[name], quantizers[name].scale, quantizers[name].zero)
-    print('Done.')
-    return model, quantizers
+    return quantized_model, quantizer
 
 
 if __name__ == '__main__':
@@ -297,8 +125,16 @@ if __name__ == '__main__':
         help='Save quantized checkpoint under this name.'
     )
     parser.add_argument(
-        '--save-quantizers', type=str, default='',
-        help='Save quantizers checkpoint under this name.'
+        '--autogptq', type=str, default=False,
+        help='Save quantized checkpoint under this name.'
+    )
+    parser.add_argument(
+        '--gptqquantizer', type=str, default=False,
+        help='Save quantized checkpoint under this name.'
+    )
+    parser.add_argument(
+        '--eval-from-path', action='store_true',
+        help='Whether to evaluate the model from existing directory.'
     )
     parser.add_argument(
         '--new-eval', action='store_true',
@@ -318,43 +154,86 @@ if __name__ == '__main__':
     )
 
     args = parser.parse_args()
+    if args.eval_from_path and os.path.exists(Path(args.save).name + "-gptq.pt"):
+        print(f'Evaluating from checkpoint {Path(args.save).name + "-gptq.pt"}')
 
-    model = get_alma(args.model)
-    print('model', args.model)
-    model.eval()
-
-    dataloader, testloader = get_loaders(
-        args.dataset, nsamples=args.nsamples, seed=args.seed, model=args.model, seqlen=model.seqlen
-    )
-
-    if args.wbits < 16 and not args.nearest:
-        tick = time.time()
-        # if os.path.exists(args.save_quantizers):
-        #     print('Loading quantizer from quantized checkpoint')
-        #     pass
-        #     ##to implement
-        # else:
-        quantizers = alma_sequential(model, dataloader, DEV)    
+        from peft import PeftModel
+        from transformers import AutoModelForCausalLM
+        from transformers import LlamaTokenizer
         
-        print('Total time:', time.time() - tick)
+        model = AutoModelForCausalLM.from_pretrained(args.model, 
+                                                 torch_dtype=torch.float16, 
+                                                 device_map="auto",
+                                                 offload_folder="./offload"
+                                                 )
+        # tokenizer = LlamaTokenizer.from_pretrained(f"{args.model}-Pretrain", padding_side='left')
 
-    datasets = ['wikitext2', 'ptb', 'c4'] 
-    if args.new_eval:
-        datasets = ['wikitext2', 'ptb-new', 'c4-new']
-    for dataset in datasets:
-        if dataset == args.dataset:
-            dataloader, testloader = get_loaders(
-                dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
-            )
-            print(dataset)
-            alma_eval(model, testloader, DEV)
+        print('model', args.model)
+        model.eval()
 
-    if args.save:
-        model, quantizers = alma_pack3(model, quantizers)
-        
-        torch.save(model.state_dict(), args.save)
-        torch.save(quantizers, args.save_quantizers)
+        seq_len = 2048
+        dataloader, testloader = get_loaders(
+            args.dataset, nsamples=args.nsamples, seed=args.seed, model=args.model, seqlen=seq_len
+        )
 
-    # if args.save:
-    #     torch.save(model.state_dict(), args.save)
+        datasets = ['wikitext2', 'ptb', 'c4'] 
+        if args.new_eval:
+            datasets = ['wikitext2', 'ptb-new', 'c4-new']
+        for dataset in datasets:
+            if dataset == args.dataset:
+                dataloader, testloader = get_loaders(
+                    dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
+                )
+                print(dataset)
+                alma_eval(model, testloader, DEV)
+
+    else:
+        if args.autogptq:
+            print(f'Quantizing basemodel with autogptq')
+            print('model', args.model)
+            model = quantize_alma_autgptq(args.model)
+
+            if args.save:
+                output_path = Path(args.save).name + "-autogptq.pt"
+                # save quantized model
+                model.save_quantized(output_path)
+                print(f"Saved autogptq smoothed model at {args.save}")
+
+        if args.gptqquantizer:
+            print(f'Quantizing basemodel with gptqquantizer')
+            print('model', args.model)
+            model, quantizer = quantize_gptqquantizer(args.model)
+
+            if args.save:
+                output_path = Path(args.save).name + "-gptq-quant.pt"
+                # save quantized model
+                quantizer.save(model, output_path)
+                # model.save_quantized(output_path)
+                print(f"Saved autogptq smoothed model at {args.save}")
+
+        else:
+            print(f'Quantizing basemodel')
+            print('model', args.model)
+
+            model = quantize_alma(args.model)
+            
+
+            if args.save:
+
+                output_path = Path(args.save).name + "-gptq.pt"
+
+                model.save_pretrained(output_path)
+                print(f"Saved gptq smoothed model at {args.save}")
+
+            
+        # datasets = ['wikitext2', 'ptb', 'c4'] 
+        # if args.new_eval:
+        #     datasets = ['wikitext2', 'ptb-new', 'c4-new']
+        # for dataset in datasets:
+        #     if dataset == args.dataset:
+        #         dataloader, testloader = get_loaders(
+        #             dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
+        #         )
+        #         print(dataset)
+        #         alma_eval(model, testloader, DEV)
 
