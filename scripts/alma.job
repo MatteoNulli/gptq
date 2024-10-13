@@ -1,0 +1,29 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu
+#SBATCH --gpus=1
+#SBATCH --job-name=Mqanf
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=9
+#SBATCH --time=02:00:00
+#SBATCH --output=outs/19d%A.out
+
+module purge
+module load 2022
+module load Anaconda3/2022.05
+cd $HOME/gptq
+source activate gptq
+
+pip install --upgrade datasets
+pip install --upgrade transformers
+pip install --upgrade protobuf
+pip install optimum
+pip install auto-gptq
+
+
+MODEL_NAME=ALMA-7B
+HF_FOLDER=haoranxu/$MODEL_NAME
+
+WBITS=4
+
+srun python alma.py $HF_FOLDER wikitext2 --wbits $WBITS --act-order --new-eval --save ${MODEL_NAME}_checkpoint_${WBITS}bits
