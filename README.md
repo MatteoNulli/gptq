@@ -1,4 +1,4 @@
-# GPTQ
+# GPTQ for ALMA
 
 This repository contains the code for quantizing [ALMA](https://github.com/fe1ixxu/ALMA) using the GPTQ technique. This is forked from the original [GPTQ](https://github.com/IST-DASLab/gptq) repository. You can find the orginal README at `README_original.md`.
 
@@ -34,3 +34,8 @@ The `--act-order` heuristic also dramatically improves accuracy on the OPT-66B o
 Dependencies are listed in `scripts/env_create.job` file and in `requirements.txt`.
 
 All experiments were run on a single 80GB NVIDIA A100. However, most experiments will work on a GPU with a lot less memory as well.
+
+
+## Cosiderations
+
+This is part of a university project at the University of Amsterdam for the Deep Learning for NLP course of Fall 2024.
